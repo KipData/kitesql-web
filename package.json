@@ -1,5 +1,5 @@
 {
-  "name": "kitesql-github-profile",
+  "name": "kitesql-website",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -9,7 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
-    "@kipdata/kite_sql": "^0.1.4"
+    "@kipdata/kite_sql": "^0.1.6"
   },
   "devDependencies": {
     "@types/node": "^22.9.0",

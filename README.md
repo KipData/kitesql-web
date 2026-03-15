@@ -1,28 +1,48 @@
-# KiteSQL GitHub Profile Demo
+# KiteSQL Website
 
-A lightweight Vite site that showcases KiteSQL running fully in the browser via WebAssembly. Use it for GitHub Pages or any static host, then embed a link in your profile README.
+A small Vite site for KiteSQL that works as both:
 
-## Setup
+- a lightweight landing page for the project
+- an in-browser playground powered by the published WebAssembly build
 
-1) Install deps (pulls the published `kite_sql` npm package):
+The site lives next to the main repository so it can be deployed independently to GitHub Pages, Cloudflare Pages, Netlify, or any other static host.
+
+## What it includes
+
+- Product-style landing page for KiteSQL
+- Rust-native API / ORM / migration positioning
+- Interactive SQL playground backed by `WasmDatabase`
+- Zero-backend demo that runs fully in the browser
+
+## Local development
+
+Install dependencies:
+
 ```bash
 npm install
 ```
-2) Run locally:
+
+Start the dev server:
+
 ```bash
 npm run dev
 ```
-> The app uses a small browser-friendly wrapper (`src/kite-sql-web.ts`) to load the npm-shipped `kite_sql_bg.wasm` with Vite’s `?url` asset handling. No local Rust build is needed.
 
-## Scripts
-- `npm run dev` — start Vite dev server.
-- `npm run build` — produce static assets in `dist/` (ready for GitHub Pages).
-- `npm run preview` — preview the production build.
+Build the static site:
 
-## Deploy to GitHub Pages
-- Push this folder as a separate repo or a `gh-pages` branch, then serve `dist/`.
-- In your GitHub profile README, link to the deployed page and add a badge/screenshot.
+```bash
+npm run build
+```
 
-## How it works
-- Uses the published `kite_sql` wasm asset from npm with a small browser loader.
-- Runs a small SQL script (create/insert/update/select) entirely in the browser, then renders the result table.
+Preview the production bundle:
+
+```bash
+npm run preview
+```
+
+## WebAssembly source
+
+The site currently uses the published npm package for KiteSQL wasm assets through `@kipdata/kite_sql`.
+That keeps the website simple to deploy because no local Rust build is required.
+
+After publishing a newer npm package, bump the dependency version here if you want the website to track the latest release.

@@ -7,8 +7,8 @@
 import wasmUrl from "@kipdata/kite_sql/kite_sql_bg.wasm?url";
 
 const placeholder: any = {};
-// The wasm expects its JS imports under the module name "./kite_sql_bg.js".
-const imports: any = { "./kite_sql_bg.js": placeholder };
+// The wasm expects its JS imports under the module name `__wbindgen_placeholder__`.
+const imports: any = { "__wbindgen_placeholder__": placeholder };
 let wasm: any;
 
 function addToExternrefTable0(obj) {
