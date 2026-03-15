@@ -1,11 +1,14 @@
 import { defineConfig } from "vite";
 
-// Vite will handle the wasm import from the bundler-target build of kite_sql.
+const base = process.env.KITESQL_WEB_BASE ?? "/";
+
 export default defineConfig({
-  // GitHub Pages site will be served from /kitesql-web/
-  base: "/kitesql-web/",
+  base,
   publicDir: "static",
   server: {
+    port: 4173,
+  },
+  preview: {
     port: 4173,
   },
 });

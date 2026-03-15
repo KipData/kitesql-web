@@ -35,6 +35,8 @@ jobs:
 
       - name: Build
         run: npm run build
+        env:
+          KITESQL_WEB_BASE: /kitesql-web/
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
