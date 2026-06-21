@@ -3,7 +3,7 @@
 A small Vite site for KiteSQL that works as both:
 
 - a lightweight landing page for the project
-- an in-browser playground powered by the published WebAssembly build
+- an in-browser playground powered by the published `kite_sql@0.3.2` WebAssembly build
 
 The site lives next to the main repository so it can be deployed independently to GitHub Pages, Cloudflare Pages, Netlify, or any other static host.
 
@@ -42,7 +42,7 @@ npm run preview
 
 ## WebAssembly source
 
-The site currently uses the published npm package for KiteSQL wasm assets through `@kipdata/kite_sql`.
+The site currently uses the published npm package for KiteSQL wasm assets through `kite_sql@0.3.2`.
 That keeps the website simple to deploy because no local Rust build is required.
 
-After publishing a newer npm package, bump the dependency version here if you want the website to track the latest release.
+When KiteSQL publishes a newer npm package, bump the `kite_sql` dependency and refresh the browser wrapper if the generated wasm-bindgen glue changes.

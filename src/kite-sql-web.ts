@@ -1,10 +1,10 @@
-// Browser-friendly wrapper around the npm-published `kite_sql` package.
+// Browser-friendly wrapper around the npm-published `kite_sql` 0.3.2 package.
 // The package ships a Node-focused glue file; this adapts it to load the wasm
 // via fetch and expose the same APIs (WasmDatabase, WasmResultIter).
 // Based on the upstream glue with minimal changes for ESM + browsers.
 // eslint-disable-next-line @typescript-eslint/ban-ts-comment
 // @ts-nocheck
-import wasmUrl from "@kipdata/kite_sql/kite_sql_bg.wasm?url";
+import wasmUrl from "kite_sql/kite_sql_bg.wasm?url";
 
 const placeholder: any = {};
 // The wasm expects its JS imports under the module name `__wbindgen_placeholder__`.
@@ -12,7 +12,7 @@ const imports: any = { "__wbindgen_placeholder__": placeholder };
 let wasm: any;
 
 function addToExternrefTable0(obj) {
-  const idx = wasm.__externref_table_alloc_command_export();
+  const idx = wasm.__externref_table_alloc();
   wasm.__wbindgen_externrefs.set(idx, obj);
   return idx;
 }
@@ -48,7 +48,7 @@ function handleError(f, args) {
     return f.apply(this, args);
   } catch (e) {
     const idx = addToExternrefTable0(e);
-    wasm.__wbindgen_exn_store_command_export(idx);
+    wasm.__wbindgen_exn_store(idx);
   }
 }
 
@@ -91,7 +91,7 @@ function passStringToWasm0(arg, malloc, realloc) {
 
 function takeFromExternrefTable0(idx) {
   const value = wasm.__wbindgen_externrefs.get(idx);
-  wasm.__externref_table_dealloc_command_export(idx);
+  wasm.__externref_table_dealloc(idx);
   return value;
 }
 
@@ -150,7 +150,7 @@ class WasmDatabase {
    * @returns {WasmResultIter}
    */
   run(sql) {
-    const ptr0 = passStringToWasm0(sql, wasm.__wbindgen_malloc_command_export, wasm.__wbindgen_realloc_command_export);
+    const ptr0 = passStringToWasm0(sql, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.wasmdatabase_run(this.__wbg_ptr, ptr0, len0);
     if (ret[2]) {
@@ -162,9 +162,31 @@ class WasmDatabase {
    * @param {string} sql
    */
   execute(sql) {
-    const ptr0 = passStringToWasm0(sql, wasm.__wbindgen_malloc_command_export, wasm.__wbindgen_realloc_command_export);
+    const ptr0 = passStringToWasm0(sql, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ret = wasm.wasmdatabase_execute(this.__wbg_ptr, ptr0, len0);
+    if (ret[1]) {
+      throw takeFromExternrefTable0(ret[0]);
+    }
+  }
+  /**
+   * @param {string} sql
+   */
+  ddl(sql) {
+    const ptr0 = passStringToWasm0(sql, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.wasmdatabase_ddl(this.__wbg_ptr, ptr0, len0);
+    if (ret[1]) {
+      throw takeFromExternrefTable0(ret[0]);
+    }
+  }
+  /**
+   * @param {string} table_name
+   */
+  analyze(table_name) {
+    const ptr0 = passStringToWasm0(table_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.wasmdatabase_analyze(this.__wbg_ptr, ptr0, len0);
     if (ret[1]) {
       throw takeFromExternrefTable0(ret[0]);
     }
@@ -244,7 +266,7 @@ placeholder.__wbg_Error_52673b7de5a0ca89 = function(arg0, arg1) {
 
 placeholder.__wbg_String_8f0eb39a4a4c2f66 = function(arg0, arg1) {
   const ret = String(arg1);
-  const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_malloc_command_export, wasm.__wbindgen_realloc_command_export);
+  const ptr1 = passStringToWasm0(ret, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
   const len1 = WASM_VECTOR_LEN;
   getDataViewMemory0().setInt32(arg0 + 4 * 1, len1, true);
   getDataViewMemory0().setInt32(arg0 + 4 * 0, ptr1, true);
@@ -297,6 +319,16 @@ placeholder.__wbg_now_69d776cd24f5215b = function() {
   const ret = Date.now();
   return ret;
 };
+
+placeholder.__wbg_push_7d9be8f38fc13975 = function(arg0, arg1) {
+  const ret = arg0.push(arg1);
+  return ret;
+};
+
+placeholder.__wbg_set_781438a03c0c3c81 = function() { return handleError(function(arg0, arg1, arg2) {
+  const ret = Reflect.set(arg0, arg1, arg2);
+  return ret;
+}, arguments); };
 
 placeholder.__wbg_set_3f1d0b984ed272ed = function(arg0, arg1, arg2) {
   arg0[arg1] = arg2;

@@ -8,12 +8,12 @@
     "build": "vite build",
     "preview": "vite preview"
   },
-  "dependencies": {
-    "@kipdata/kite_sql": "^0.1.6"
-  },
   "devDependencies": {
     "@types/node": "^22.9.0",
     "typescript": "^5.6.3",
     "vite": "^5.4.10"
+  },
+  "dependencies": {
+    "kite_sql": "0.3.2"
   }
 }

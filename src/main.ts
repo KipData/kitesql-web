@@ -54,7 +54,7 @@ ui.innerHTML = `
         <div class="hero-points">
           <div class="metric"><strong>Rust-native</strong><span>typed APIs alongside SQL</span></div>
           <div class="metric"><strong>Model-driven</strong><span>ORM, CRUD, migrations, query builder</span></div>
-          <div class="metric"><strong>Browser-ready</strong><span>same engine available through wasm</span></div>
+          <div class="metric"><strong>Browser-ready</strong><span>npm wasm package at 0.3.2</span></div>
         </div>
       </div>
       <div class="hero-side">
@@ -70,13 +70,17 @@ struct User {
     score: i32,
 }
 
-db.migrate::<User>()?;
-db.insert(&user)?;
-let rows = db
-    .select::<User>()
-    .filter(User::score().gte(90))
-    .order_by(User::score().desc())
-    .fetch()?;</code></pre>
+database.migrate::<User>()?;
+database.insert_many(users)?;
+
+let rows = database
+    .bind(|ctx| {
+        ctx.from::<User>()?
+            .filter(|e| e.column(User::score())?.gte(90))?
+            .project_scalars((User::id(), User::email()))?
+            .finish()
+    })?
+    .project_tuple::<(i32, String)>();</code></pre>
         </div>
         <div class="mini-card secondary sql-card">
 <pre><code>SELECT team, AVG(score) AS avg_score
@@ -114,7 +118,7 @@ ORDER BY avg_score DESC;</code></pre>
         </article>
         <article class="feature-card card-lite">
           <h3>Runs in the browser</h3>
-          <p>The published WebAssembly build lets users explore KiteSQL in a browser tab with no backend service and no local database server.</p>
+          <p>The published <code>kite_sql@0.3.2</code> WebAssembly build lets users explore KiteSQL in a browser tab with no backend service and no local database server.</p>
         </article>
       </div>
     </section>
@@ -140,20 +144,23 @@ ORDER BY avg_score DESC;</code></pre>
         </div>
       </div>
       <div class="card-lite info-panel code-panel">
-        <div class="eyebrow">Typical flow</div>
-<pre><code>let db = DataBaseBuilder::path("./data").build()?;
+        <div class="eyebrow">Typical flow in 0.3.2</div>
+<pre><code>let mut database = DataBaseBuilder::path("./data").build_rocksdb()?;
 
-db.migrate::<User>()?;
-db.insert(&user)?;
+database.migrate::<User>()?;
+database.insert_many(users)?;
 
-let ranked = db
-    .select::<User>()
-    .filter(User::score().gte(80))
-    .order_by(User::score().desc())
-    .limit(20)
-    .fetch()?;
+let ranked = database
+    .bind(|ctx| {
+        ctx.from::<User>()?
+            .filter(|e| e.column(User::score())?.gte(80))?
+            .project_scalars((User::id(), User::email()))?
+            .limit(20)?
+            .finish()
+    })?
+    .project_tuple::<(i32, String)>();
 
-let rows = db.run("select count(*) from users")?;</code></pre>
+let rows = database.run("select count(*) from users")?;</code></pre>
       </div>
     </section>
 
@@ -163,7 +170,7 @@ let rows = db.run("select count(*) from users")?;</code></pre>
           <div class="eyebrow">WebAssembly playground</div>
           <h2>Open a browser tab and play with KiteSQL</h2>
         </div>
-        <p>This playground runs fully in your browser using the published <code>kite_sql</code> wasm bundle. No server, no backend, no setup beyond loading the page.</p>
+        <p>This playground runs fully in your browser using the published <code>kite_sql@0.3.2</code> wasm bundle. No server, no backend, no setup beyond loading the page.</p>
       </div>
 
       <div class="playground card">
@@ -212,7 +219,7 @@ let rows = db.run("select count(*) from users")?;</code></pre>
   </main>
 
   <footer class="footer-strip">
-    <div>Runs entirely in the browser through the published WebAssembly build.</div>
+    <div>Runs entirely in the browser through the published <code>kite_sql@0.3.2</code> WebAssembly build.</div>
     <div class="footer-links">
       <a href="https://github.com/KipData/KiteSQL" target="_blank" rel="noreferrer">GitHub</a>
       <a href="https://crates.io/crates/kite_sql" target="_blank" rel="noreferrer">crates.io</a>
@@ -397,11 +404,12 @@ async function seedDemoData(showResult = true) {
   if (!db) return;
 
   const steps = [
-    "drop table if exists contributors",
-    "create table contributors(id int primary key, name varchar, team varchar, score int)",
     "insert into contributors values (1, 'Ada', 'engine', 98), (2, 'Lin', 'engine', 91), (3, 'Mia', 'product', 87), (4, 'Kai', 'research', 94), (5, 'Ivy', 'product', 89), (6, 'Noah', 'research', 96)",
     "update contributors set score = score + 1 where team = 'product'",
   ];
+
+  db.ddl("drop table if exists contributors");
+  db.ddl("create table contributors(id int primary key, name varchar, team varchar, score int)");
 
   for (const sql of steps) {
     await db.execute(sql);
@@ -412,7 +420,6 @@ async function seedDemoData(showResult = true) {
     const schema = typeof (result as any).schema === "function" ? (result as any).schema() : null;
     const columns = columnNamesFromSchema(schema);
     const rows = result.rows();
-    result.finish();
     renderRows(rows, columns);
   }
 
@@ -451,7 +458,6 @@ async function runSql(sqlText: string) {
         const schema = typeof (result as any).schema === "function" ? (result as any).schema() : null;
         lastColumns = columnNamesFromSchema(schema);
         lastRows = result.rows();
-        result.finish();
       } else {
         await db!.execute(sql);
       }
