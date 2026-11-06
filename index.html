@@ -1,24 +1,44 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>KiteSQL | Embedded relational engine for Rust</title>
-    <meta
-      name="description"
-      content="KiteSQL is an embedded relational engine for Rust with SQL, native APIs, ORM workflows, schema migration, and an in-browser WebAssembly playground."
-    />
-    <link rel="icon" type="image/jpeg" href="/favicon.jpeg" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap"
-      rel="stylesheet"
-    />
-    <link rel="stylesheet" href="/src/style.css" />
-  </head>
-  <body>
-    <div id="app"></div>
-    <script type="module" src="/src/main.ts"></script>
-  </body>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Blogs · KiteSQL</title>
+  <meta name="description" content="Engineering notes from the KiteSQL project.">
+  <link rel="icon" type="image/jpeg" href="favicon.jpeg">
+  <link rel="stylesheet" href="assets/style.css">
+  <link rel="stylesheet" href="assets/highlight.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="index.html">
+      <img class="logo-light" src="assets/kite_sql_light.png" alt="KiteSQL">
+      <img class="logo-dark" src="assets/kite_sql_dark.png" alt="KiteSQL">
+    </a>
+    <nav class="site-nav">
+      <a href="index.html" aria-current="page">Blogs</a>
+      <a href="https://github.com/KipData/KiteSQL">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+<h1 class="page-title">Blogs</h1>
+<ul class="post-list">
+    <li>
+      <div class="post-meta"><time datetime="2026-11-06">2026-11-06</time><span class="sep">·</span><span class="langs"><a href="blog/zero-copy-sql-on-lmdb.html">English</a> · <a href="blog/zero-copy-sql-on-lmdb.zh-CN.html">中文</a></span></div>
+      <h2><a href="blog/zero-copy-sql-on-lmdb.html">Zero-Copy SQL Computation on LMDB</a></h2>
+      <p>If the storage layer is an mmap-based KV engine such as LMDB, can a SQL engine let query results borrow pages all the way from storage to the caller? A look at how, with SQLite (mmap on) as the baseline.</p>
+    </li>
+</ul>
+</main>
+<footer class="site-footer">
+  <div class="wrap">
+    <span>© 2026 KipData</span>
+    <span><a href="https://github.com/KipData/KiteSQL">KiteSQL on GitHub</a></span>
+  </div>
+</footer>
+
+</body>
 </html>

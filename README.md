@@ -1,48 +1,36 @@
 # KiteSQL Website
 
-A small Vite site for KiteSQL that works as both:
+Static blog for [KiteSQL](https://github.com/KipData/KiteSQL). Plain HTML and CSS, no build step to deploy: every push to `main` uploads the repository as-is to GitHub Pages.
 
-- a lightweight landing page for the project
-- an in-browser playground powered by the published `kite_sql@0.3.2` WebAssembly build
-
-The site lives next to the main repository so it can be deployed independently to GitHub Pages, Cloudflare Pages, Netlify, or any other static host.
-
-## What it includes
-
-- Product-style landing page for KiteSQL
-- Rust-native API / ORM / migration positioning
-- Interactive SQL playground backed by `WasmDatabase`
-- Zero-backend demo that runs fully in the browser
-
-## Local development
-
-Install dependencies:
-
-```bash
-npm install
+```
+index.html          Blogs
+blog/<slug>.html    one page per post (and per translation)
+posts/*.md          Markdown sources
+assets/             stylesheet, syntax highlighting, logo
+tools/build.py      renders posts/*.md into blog/ and index.html
 ```
 
-Start the dev server:
+## Writing a post
 
-```bash
-npm run dev
-```
+1. Add `posts/<slug>.md` with a front matter block:
 
-Build the static site:
+   ```
+   ---
+   title: Post title
+   date: 2026-11-06
+   slug: post-slug
+   lang: en
+   summary: one line shown on the index
+   ---
+   ```
 
-```bash
-npm run build
-```
+   A translation uses its own `slug` and `lang`, plus `translation_of: <primary slug>`. The index lists the primary post and links the translations beside it.
 
-Preview the production bundle:
+2. Render:
 
-```bash
-npm run preview
-```
+   ```bash
+   python3 -m venv .venv && .venv/bin/pip install markdown pygments
+   .venv/bin/python tools/build.py
+   ```
 
-## WebAssembly source
-
-The site currently uses the published npm package for KiteSQL wasm assets through `kite_sql@0.3.2`.
-That keeps the website simple to deploy because no local Rust build is required.
-
-When KiteSQL publishes a newer npm package, bump the `kite_sql` dependency and refresh the browser wrapper if the generated wasm-bindgen glue changes.
+3. Commit the generated `index.html`, `blog/*.html` and `assets/highlight.css` together with the Markdown.

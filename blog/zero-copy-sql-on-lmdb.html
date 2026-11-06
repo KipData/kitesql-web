@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Zero-Copy SQL Computation on LMDB · KiteSQL</title>
+  <meta name="description" content="If the storage layer is an mmap-based KV engine such as LMDB, can a SQL engine let query results borrow pages all the way from storage to the caller? A look at how, with SQLite (mmap on) as the baseline.">
+  <link rel="icon" type="image/jpeg" href="../favicon.jpeg">
+  <link rel="stylesheet" href="../assets/style.css">
+  <link rel="stylesheet" href="../assets/highlight.css">
+</head>
+<body>
+<header class="site-header">
+  <div class="wrap">
+    <a class="brand" href="../index.html">
+      <img class="logo-light" src="../assets/kite_sql_light.png" alt="KiteSQL">
+      <img class="logo-dark" src="../assets/kite_sql_dark.png" alt="KiteSQL">
+    </a>
+    <nav class="site-nav">
+      <a href="../index.html">Blogs</a>
+      <a href="https://github.com/KipData/KiteSQL">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+<article class="post">
+  <header class="post-header">
+    <h1>Zero-Copy SQL Computation on LMDB</h1>
+    <div class="post-meta"><time datetime="2026-11-06">2026-11-06</time><span class="sep">·</span><span class="langs"><span>English</span> · <a href="../blog/zero-copy-sql-on-lmdb.zh-CN.html">中文</a></span></div>
+  </header>
+  <div class="post-body">
+<blockquote>
+<p>By the time a database hands a row to your application, its strings have usually been copied several times: from the file into a cache, from the cache into the executor, and from the executor into your struct. This article explores another option. If the storage layer is an mmap-based KV engine such as LMDB, the pages a read-only transaction reads keep their addresses until the transaction ends. Can a SQL engine then let query results borrow those pages all the way through, so that the whole SQL computation runs without copying?</p>
+</blockquote>
+<h2>Summary</h2>
+<p>SQLite is the most common in-process SQL database, with stable bindings in most languages. This example uses Rust's rusqlite. A very common task: fetch all comments under a thread, map them to structs, assemble them into a reply tree by <code>parent_id</code>, and serialize the tree as nested JSON for the caller:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">rusqlite</span><span class="p">::{</span><span class="n">params</span><span class="p">,</span><span class="w"> </span><span class="n">Connection</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">serde</span><span class="p">::</span><span class="n">Serialize</span><span class="p">;</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">collections</span><span class="p">::</span><span class="n">HashMap</span><span class="p">;</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">error</span><span class="p">::</span><span class="n">Error</span><span class="p">;</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">io</span><span class="p">::</span><span class="n">Write</span><span class="p">;</span>
+
+<span class="cp">#[derive(Serialize)]</span>
+<span class="k">struct</span><span class="w"> </span><span class="nc">Post</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">id</span><span class="p">:</span><span class="w"> </span><span class="kt">i64</span><span class="p">,</span>
+<span class="w">    </span><span class="n">thread_id</span><span class="p">:</span><span class="w"> </span><span class="kt">i64</span><span class="p">,</span>
+<span class="w">    </span><span class="n">parent_id</span><span class="p">:</span><span class="w"> </span><span class="kt">i64</span><span class="p">,</span><span class="w"> </span><span class="c1">// 0 means a top-level comment</span>
+<span class="w">    </span><span class="n">user</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<span class="w">    </span><span class="n">body</span><span class="p">:</span><span class="w"> </span><span class="nb">String</span><span class="p">,</span>
+<span class="p">}</span>
+
+<span class="cp">#[derive(Serialize)]</span>
+<span class="k">struct</span><span class="w"> </span><span class="nc">Comment</span><span class="o">&lt;'</span><span class="na">a</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="cp">#[serde(flatten)]</span>
+<span class="w">    </span><span class="n">post</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="o">'</span><span class="na">a</span><span class="w"> </span><span class="nc">Post</span><span class="p">,</span>
+<span class="w">    </span><span class="n">replies</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="n">Comment</span><span class="o">&lt;'</span><span class="na">a</span><span class="o">&gt;&gt;</span><span class="p">,</span>
+<span class="p">}</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">build</span><span class="o">&lt;'</span><span class="na">a</span><span class="o">&gt;</span><span class="p">(</span><span class="n">children</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="o">'</span><span class="na">a</span><span class="w"> </span><span class="nc">HashMap</span><span class="o">&lt;</span><span class="kt">i64</span><span class="p">,</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="n">Post</span><span class="o">&gt;&gt;</span><span class="p">,</span><span class="w"> </span><span class="n">parent</span><span class="p">:</span><span class="w"> </span><span class="kt">i64</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="n">Comment</span><span class="o">&lt;'</span><span class="na">a</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">posts</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">children</span><span class="p">.</span><span class="n">get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">parent</span><span class="p">)</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="nb">Vec</span><span class="p">::</span><span class="n">new</span><span class="p">()</span><span class="w"> </span><span class="p">};</span>
+<span class="w">    </span><span class="n">posts</span><span class="p">.</span><span class="n">iter</span><span class="p">()</span>
+<span class="w">        </span><span class="p">.</span><span class="n">map</span><span class="p">(</span><span class="o">|</span><span class="n">post</span><span class="o">|</span><span class="w"> </span><span class="n">Comment</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">post</span><span class="p">,</span><span class="w"> </span><span class="n">replies</span><span class="p">:</span><span class="w"> </span><span class="nc">build</span><span class="p">(</span><span class="n">children</span><span class="p">,</span><span class="w"> </span><span class="n">post</span><span class="p">.</span><span class="n">id</span><span class="p">)</span><span class="w"> </span><span class="p">})</span>
+<span class="w">        </span><span class="p">.</span><span class="n">collect</span><span class="p">()</span>
+<span class="p">}</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">write_thread</span><span class="p">(</span><span class="n">conn</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">Connection</span><span class="p">,</span><span class="w"> </span><span class="n">thread_id</span><span class="p">:</span><span class="w"> </span><span class="kt">i64</span><span class="p">,</span><span class="w"> </span><span class="n">out</span><span class="p">:</span><span class="w"> </span><span class="nc">impl</span><span class="w"> </span><span class="n">Write</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">(),</span><span class="w"> </span><span class="nb">Box</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">Error</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">stmt</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">conn</span><span class="p">.</span><span class="n">prepare_cached</span><span class="p">(</span><span class="s">"select id, thread_id, parent_id, user, body from posts where thread_id = ?1"</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">rows</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">stmt</span><span class="p">.</span><span class="n">query</span><span class="p">(</span><span class="n">params</span><span class="o">!</span><span class="p">[</span><span class="n">thread_id</span><span class="p">])</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="c1">// Building the tree needs every row, but a row only lives until the next call to next, so Post must own its Strings</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">children</span><span class="p">:</span><span class="w"> </span><span class="nc">HashMap</span><span class="o">&lt;</span><span class="kt">i64</span><span class="p">,</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="n">Post</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">HashMap</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<span class="w">    </span><span class="k">while</span><span class="w"> </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">row</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">rows</span><span class="p">.</span><span class="n">next</span><span class="p">()</span><span class="o">?</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">post</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">Post</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">id</span><span class="p">:</span><span class="w"> </span><span class="nc">row</span><span class="p">.</span><span class="n">get</span><span class="p">(</span><span class="mi">0</span><span class="p">)</span><span class="o">?</span><span class="p">,</span>
+<span class="w">            </span><span class="n">thread_id</span><span class="p">:</span><span class="w"> </span><span class="nc">row</span><span class="p">.</span><span class="n">get</span><span class="p">(</span><span class="mi">1</span><span class="p">)</span><span class="o">?</span><span class="p">,</span>
+<span class="w">            </span><span class="n">parent_id</span><span class="p">:</span><span class="w"> </span><span class="nc">row</span><span class="p">.</span><span class="n">get</span><span class="p">(</span><span class="mi">2</span><span class="p">)</span><span class="o">?</span><span class="p">,</span>
+<span class="w">            </span><span class="n">user</span><span class="p">:</span><span class="w"> </span><span class="nc">row</span><span class="p">.</span><span class="n">get</span><span class="p">(</span><span class="mi">3</span><span class="p">)</span><span class="o">?</span><span class="p">,</span>
+<span class="w">            </span><span class="n">body</span><span class="p">:</span><span class="w"> </span><span class="nc">row</span><span class="p">.</span><span class="n">get</span><span class="p">(</span><span class="mi">4</span><span class="p">)</span><span class="o">?</span><span class="p">,</span>
+<span class="w">        </span><span class="p">};</span>
+<span class="w">        </span><span class="n">children</span><span class="p">.</span><span class="n">entry</span><span class="p">(</span><span class="n">post</span><span class="p">.</span><span class="n">parent_id</span><span class="p">).</span><span class="n">or_default</span><span class="p">().</span><span class="n">push</span><span class="p">(</span><span class="n">post</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">serde_json</span><span class="p">::</span><span class="n">to_writer</span><span class="p">(</span><span class="n">out</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">build</span><span class="p">(</span><span class="o">&amp;</span><span class="n">children</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">))</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>For this utterly ordinary "fetch rows, map them to structs" code, the data goes through these steps before it becomes the <code>Post</code> in your hands:</p>
+<div class="codehilite"><pre><span></span><code> Database file
+     │
+     │  Default: read() copies whole pages into SQLite's page cache   [copy]
+     │  - With mmap_size: read the mapped file pages directly
+     ▼
+ B-tree page (page cache or file mapping)
+     │
+     │  sqlite3_step → OP_Column decodes user / body from the record
+     │    - Within a page: copy into a register buffer                  [copy]
+     │    - Across overflow pages: malloc a buffer, join page by page   [alloc][copy]
+     │  With ORDER BY / GROUP BY: write into the sorter and read back   [copy]
+     ▼
+ Register buffer
+     │
+     │  sqlite3_column_text → rusqlite row.get()
+     │  The pointer only lives until the next call to next, so Post must own a copy
+     │  user / body each become a String                                [alloc][copy] × 2
+     ▼
+ Post { user: String, body: String, .. }
+     │
+     │  Build the tree by parent_id and write it out recursively
+     │  serde_json::to_writer writes the JSON
+     ▼
+ JSON
+</code></pre></div>
+
+<p>Along this path, both SQLite and its API contract require strings to be moved somewhere else. The more fields, the longer the strings and the more complex the query, the more copies and allocations happen along the way. This is in fact the standard design of most databases: manage your own buffer pool, control memory in user space, and don't let the operating system decide which pages stay in memory. The cost is that a page in the pool can be evicted at any moment, so data must be copied before it is handed out. If, as DBOS [1] envisions, the database moved into the operating system kernel and managed the OS state itself, the user-space buffer pool and the kernel page cache might no longer need to be two separate layers.</p>
+<p>Yet in typical web applications, the main work of many queries is just shaping and passing data along: take data out of SQL, convert it into the corresponding structs (POJOs in Java) with some light processing, serialize it to JSON, and return it over HTTP. GraphQL [2] turned this into an interface specification: the caller describes the fields and nesting it wants, and the server takes the columns out of the database in that shape, assembles them and serializes them, doing almost nothing else. This kind of nearly pure read-and-reshape work makes up a growing share of web backends.</p>
+<p>Here, every <code>String</code> field of <code>Post</code> costs one allocation, and more fields mean more allocations. Look back at the flow above and you'll see each string is copied twice. The first copy happens when SQLite's <code>step</code> reads the column and copies it from the page into a register buffer; even with mmap enabled, this copy can't be avoided. The second happens when mapping to <code>Post</code>, copying from the register buffer into each field. But <code>row.get_ref</code> can lend out a <code>&amp;str</code> directly. Why not let <code>Post</code>'s fields borrow it and skip the second copy? Unfortunately, <code>row</code> only lives until the next call to <code>next</code>, so a <code>Post</code> borrowing from it can't outlive the row, and the compiler rejects it outright. Building the tree needs all rows at once, and neither SQL sorting nor JSON functions can produce nesting of arbitrary depth, so these rows must all be held at the same time. This copy comes from SQLite's API contract, and code on top of it can hardly avoid it.</p>
+<h2>Zero-Copy Computation from Storage to Results</h2>
+<h3>MMAP Storage</h3>
+<p>Andy Pavlo once said that MMAP will ruin your database and your life [3]. That was one of the rejected title candidates for his CIDR 2022 paper with Crotty and Leis, finally titled <em>Are You Sure You Want to Use MMAP in Your Database Management System?</em>. The paper lists four classes of problems with using mmap instead of a buffer pool in a database: transactional safety, I/O stalls, error handling and performance. As the title suggests, this work does not call mmap directly to build its own storage. It uses LMDB as the storage backend instead. LMDB is a mature embedded KV storage engine whose design avoids the most serious problem in the paper, transactional safety [4]:</p>
+<ul>
+<li><strong>Read-only mapping by default.</strong> The file is mapped read-only, so the process cannot modify it through pointers. Stray pointer writes in the host program can't corrupt the database, and the mapping holds no dirty pages the kernel could write back on its own. Trying to modify a value returned by a read-only transaction triggers SIGSEGV immediately.</li>
+<li><strong>Writes bypass the mapping.</strong> A write transaction modifies its pages in heap memory first, writes them back to the file with <code>pwrite</code> at commit, then calls <code>fsync</code> as configured. LMDB alone decides when and in what order data reaches disk.</li>
+<li><strong>Copy-on-write B+ tree (shadow paging).</strong> Committed pages are never modified in place. Changing a leaf writes a new page and copies every page on the path up to the root.</li>
+<li><strong>Two alternating meta pages.</strong> The last step of a commit writes a meta page that records the new root. The two copies are written alternately, so after a crash one of them is always complete, and the database never stops in a half-written state.</li>
+<li><strong>A reader table protects snapshots.</strong> Every read-only transaction registers the version it sees, and old pages it might read are never reclaimed for reuse. So a value read by a read-only transaction stays valid at the same address until the transaction ends. This is exactly the guarantee that <strong>zero-copy SQL computation</strong> relies on.</li>
+<li><strong>A single writer.</strong> Only one write transaction runs at a time, and the paper notes that this is how LMDB avoids conflicts between transactions.</li>
+</ul>
+<p>LMDB does not solve the paper's other problems, of course: a page fault blocks the thread synchronously, I/O errors turn into SIGBUS, and the kernel decides which pages stay in memory. LMDB assumes the hot data fits in memory, and in the embedded scenarios SQLite targets, that assumption usually holds.</p>
+<h3>Data Encode</h3>
+<p>The first step in building SQL on a KV store is deciding how a row becomes a key and a value. TiDB's approach is representative [5]:</p>
+<div class="codehilite"><pre><span></span><code>Row:   t{TableID}_r{RowID}                                    →  [col1, col2, col3, ...]
+Index: t{TableID}_i{IndexID}_{indexed column values}_{RowID}  →  null
+</code></pre></div>
+
+<p>Rows of the same table share a prefix and are sorted by primary key, so both full table scans and index lookups become range scans over contiguous keys. The implementation here uses the same structure: the key is "table ID + type tag + primary key", and the value holds the row's columns.</p>
+<p>For zero copy, what matters is how strings are stored in the value. Take the <code>orders</code> table used in the benchmarks below. After inserting the row <code>(1, 7, 'paid', 42, 'hello')</code>, its value looks like this:</p>
+<div class="codehilite"><pre><span></span><code>  00                               null bitmap
+  01 00 00 00                      id = 1
+  07 00 00 00                      customer_id = 7
+  04 00 00 00 70 61 69 64          status: length 4 + "paid"
+  2a 00 00 00                      amount = 42
+  05 00 00 00 68 65 6c 6c 6f       note: length 5 + "hello"
+  00 00 00 00 00 00 00 00          statement stamp: the id of the statement that wrote this row, used by updates to skip rows the same statement just wrote
+</code></pre></div>
+
+<p>Strings are stored contiguously as "length + raw bytes". Decoding <code>note</code> only needs to read its 4-byte length to get a (pointer, length) pair pointing into an LMDB page, which is exactly a <code>&amp;str</code> with no conversion at all. LMDB also guarantees that the overflow pages holding a large value are contiguous, so however long the string is, its bytes form one contiguous block in the mapping and can be lent out directly. Note that all columns of a row form a single LMDB value. LMDB places a value that doesn't fit in a leaf on a contiguous run of overflow pages, so the whole row is contiguous, not just one field: <code>status</code> and <code>note</code> are simply two offsets into the same bytes.</p>
+<p>Putting large values on separate pages follows the same idea as PostgreSQL's TOAST and InnoDB's external pages. Those mechanisms solve row bloat, so queries that read only small columns don't touch large values. They don't solve copying, though: values are still copied when fetched into the application. The truly copy-free approach is something like FILESTREAM, handing the value out as a file handle, but then it is no longer a SQL value. The engine can no longer filter, sort or measure it, and it no longer lines up with the row's transaction snapshot. The difference here is that overflow pages stay in the same mapping and the same read-only transaction, so operators and the caller see the same bytes.</p>
+<h3>Execution</h3>
+<p>Lending strings out of storage is only the first step. A SQL statement passes through a chain of operators, such as scan, filter, sort, group and join, before its results reach the caller, and if any layer copies a string, zero copy breaks there. The approach is a discipline: storage provides a lifetime, operators don't break it, and Rust's borrow checker lets this be enforced at compile time.</p>
+<p><strong>Value representation: either owned or borrowed.</strong> Strings and binary values use the same type (simplified):</p>
+<div class="codehilite"><pre><span></span><code><span class="k">pub</span><span class="w"> </span><span class="k">struct</span><span class="w"> </span><span class="nc">MaybeMapped</span><span class="o">&lt;</span><span class="n">B</span><span class="p">:</span><span class="w"> </span><span class="o">?</span><span class="nb">Sized</span><span class="o">&gt;</span><span class="p">(</span><span class="n">Repr</span><span class="o">&lt;</span><span class="n">B</span><span class="o">&gt;</span><span class="p">);</span>
+
+<span class="k">enum</span><span class="w"> </span><span class="nc">Repr</span><span class="o">&lt;</span><span class="n">B</span><span class="p">:</span><span class="w"> </span><span class="o">?</span><span class="nb">Sized</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="n">Owned</span><span class="p">(</span><span class="n">B</span><span class="p">::</span><span class="n">Owned</span><span class="p">),</span><span class="w">     </span><span class="c1">// memory it owns: literals in SQL, new values computed by expressions</span>
+<span class="w">    </span><span class="n">Mapped</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">ptr</span><span class="p">,</span><span class="w"> </span><span class="n">len</span><span class="w"> </span><span class="p">},</span><span class="w"> </span><span class="c1">// a (pointer, length) pair pointing into a page read by a read-only transaction</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>Both states appear in the same query. In <code>where note = 'hello'</code>, for instance, the constant <code>'hello'</code> is <code>Owned</code> and the column value <code>note</code> is <code>Mapped</code>.</p>
+<p>When a column value is <code>Mapped</code> depends on the transaction. A read-only transaction declares at its start that "the bytes it reads stay valid at the same address until it ends", so row decoding produces <code>Mapped</code> directly. A write transaction can't promise this, so decoding has to copy and produces <code>Owned</code>.</p>
+<p><strong>Materializing operators copy only pointers.</strong> A materializing operator must collect rows from upstream: sort gathers all rows, grouping keeps group keys, hash join builds a hash table, and window functions hold an entire partition. When they keep values, a <code>Mapped</code> string copies only its (pointer, length), not its content. The whole query runs in one read-only transaction and those pages never become invalid, so as long as nothing spills, materializing operators can keep values in their in-memory containers as borrows. New strings appear only in a few cases: values computed by expressions (such as <code>upper(note)</code>), and values serialized out and read back when the data is large enough to spill. In principle, spilled files could also be read back through mmap and borrowed again, but that is extra work.</p>
+<p><strong>How long borrows last: enforced by the compiler outside, by convention inside.</strong> The risk of borrowing is a pointer outliving its page. This is handled in two layers:</p>
+<ul>
+<li>Results handed to the caller are tied to the transaction's lifetime. The <code>Post</code> in the conclusion works this way: it can outlive any single row and be used until the transaction ends, but trying to carry it out of the transaction is rejected by the compiler.</li>
+<li>Borrows inside the executor rely on convention. The same prepared statement can run repeatedly in different transactions, so before each execution, operators must clear the borrowed values left from the previous run. The compiler can't check this layer; a liveness check in debug builds backs it up, panicking on any read of a borrowed value whose transaction has ended.</li>
+</ul>
+<h2>Benchmarking SQL Execution: SQLite with mmap vs. LMDB SQL</h2>
+<p>In the benchmarks below, both sides load identical data, build the same indexes and run the same SQL. Each statement is prepared once, and all executions run in one read-only transaction. SQLite has <code>PRAGMA mmap_size</code> enabled (1 GiB, larger than the database file, so the whole file is mapped), so both sides read the database file through a memory mapping, and the I/O conditions are the same.</p>
+<ul>
+<li><strong>LMDB SQL</strong>: the SQL engine running on LMDB read-only transactions, with strings borrowed from storage all the way to the caller.</li>
+<li><strong>LMDB SQL (forced copy)</strong>: the same query run in a write transaction, so strings are copied. This is the control group.</li>
+<li><strong>SQLite</strong>: SQLite 3.45.1 with mmap enabled.</li>
+</ul>
+<p>Allocations are counted at libc's <code>malloc</code>. The machine is an i9-13900HX, with the program pinned to one P-core (<code>cpu8</code>).</p>
+<p>The goal is not to prove which side is faster, but to find the string length at which the cost of copying starts to show. So string lengths range from 64 B up to 256 KiB. At 64 B SQLite leads, and 256 KiB is far larger than a typical column in a business table; the tiers in between are the common document, log and JSON fields.</p>
+<p>Tables 1 to 3 use the <code>orders</code> table below. <code>note</code> is loaded at lengths from 64 B to 256 KiB, each tier in its own database, and each query hits about 10 rows by <code>(customer_id, status)</code>.</p>
+<div class="codehilite"><pre><span></span><code><span class="k">create</span><span class="w"> </span><span class="k">table</span><span class="w"> </span><span class="n">orders</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="n">id</span><span class="w">          </span><span class="nb">int</span><span class="w"> </span><span class="k">primary</span><span class="w"> </span><span class="k">key</span><span class="p">,</span>
+<span class="w">    </span><span class="n">customer_id</span><span class="w"> </span><span class="nb">int</span><span class="p">,</span>
+<span class="w">    </span><span class="n">status</span><span class="w">      </span><span class="nb">varchar</span><span class="p">,</span><span class="w">  </span><span class="c1">-- 'new' / 'paid' / 'shipped' / 'done' / 'void'</span>
+<span class="w">    </span><span class="n">amount</span><span class="w">      </span><span class="nb">int</span><span class="p">,</span>
+<span class="w">    </span><span class="n">note</span><span class="w">        </span><span class="nb">varchar</span>
+<span class="p">);</span>
+<span class="k">create</span><span class="w"> </span><span class="k">index</span><span class="w"> </span><span class="n">orders_customer_status</span><span class="w"> </span><span class="k">on</span><span class="w"> </span><span class="n">orders</span><span class="w"> </span><span class="p">(</span><span class="n">customer_id</span><span class="p">,</span><span class="w"> </span><span class="n">status</span><span class="p">);</span>
+</code></pre></div>
+
+<p><strong>Table 1: Plain index lookup</strong></p>
+<p>Fetch about 10 rows through the index, and the caller reads every string. Reproduce with <code>examples/alloc_trace.rs</code> [6].</p>
+<div class="codehilite"><pre><span></span><code><span class="k">select</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">status</span><span class="p">,</span><span class="w"> </span><span class="n">amount</span><span class="p">,</span><span class="w"> </span><span class="n">note</span><span class="w"> </span><span class="k">from</span><span class="w"> </span><span class="n">orders</span>
+<span class="k">where</span><span class="w"> </span><span class="n">customer_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="err">$</span><span class="mi">1</span><span class="w"> </span><span class="k">and</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="err">$</span><span class="mi">2</span><span class="w"> </span><span class="k">and</span><span class="w"> </span><span class="n">amount</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="err">$</span><span class="mi">3</span><span class="p">;</span>
+</code></pre></div>
+
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">note length</th>
+<th style="text-align: right;">LMDB SQL</th>
+<th style="text-align: right;">LMDB SQL (forced copy)</th>
+<th style="text-align: right;">SQLite</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">64 B</td>
+<td style="text-align: right;">3.74 / 0.4</td>
+<td style="text-align: right;">5.22 / 1.1</td>
+<td style="text-align: right;">2.99 / 0</td>
+</tr>
+<tr>
+<td style="text-align: right;">1 KiB</td>
+<td style="text-align: right;">3.70 / 0.4</td>
+<td style="text-align: right;">5.33 / 10</td>
+<td style="text-align: right;">3.44 / 0</td>
+</tr>
+<tr>
+<td style="text-align: right;">4 KiB</td>
+<td style="text-align: right;">4.37 / 0.4</td>
+<td style="text-align: right;">8.00 / 40</td>
+<td style="text-align: right;">6.44 / 40</td>
+</tr>
+<tr>
+<td style="text-align: right;">16 KiB</td>
+<td style="text-align: right;">3.65 / 0.4</td>
+<td style="text-align: right;">13.07 / 160</td>
+<td style="text-align: right;">11.60 / 158</td>
+</tr>
+<tr>
+<td style="text-align: right;">64 KiB</td>
+<td style="text-align: right;">2.56 / 0.4</td>
+<td style="text-align: right;">18.57 / 640</td>
+<td style="text-align: right;">18.05 / 628</td>
+</tr>
+<tr>
+<td style="text-align: right;">256 KiB</td>
+<td style="text-align: right;">2.38 / 0.4</td>
+<td style="text-align: right;">61.58 / 2560</td>
+<td style="text-align: right;">66.14 / 2458</td>
+</tr>
+</tbody>
+</table>
+<p>Unit: each cell is "p50 latency µs / KiB allocated per execution".</p>
+<p><strong>Table 2: Length functions</strong></p>
+<p>Same predicate and data as Table 1, with only the projection replaced by a length function. The first column fetches <code>note</code> and has the caller call <code>len()</code> on the string; <code>char_length</code> corresponds to <code>length()</code> in SQLite.</p>
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">note length</th>
+<th style="text-align: right;"><code>select note</code>, caller calls <code>len()</code></th>
+<th style="text-align: right;"><code>octet_length(note)</code></th>
+<th style="text-align: right;"><code>char_length(note)</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">64 B</td>
+<td style="text-align: right;">3.56 / 2.52</td>
+<td style="text-align: right;">3.81 / 2.51</td>
+<td style="text-align: right;">3.93 / 2.77</td>
+</tr>
+<tr>
+<td style="text-align: right;">4 KiB</td>
+<td style="text-align: right;">4.33 / 6.87</td>
+<td style="text-align: right;">4.77 / 2.93</td>
+<td style="text-align: right;">7.34 / 16.07</td>
+</tr>
+<tr>
+<td style="text-align: right;">64 KiB</td>
+<td style="text-align: right;">2.35 / 20.35</td>
+<td style="text-align: right;">2.75 / 1.95</td>
+<td style="text-align: right;">26.07 / 164.01</td>
+</tr>
+<tr>
+<td style="text-align: right;">256 KiB</td>
+<td style="text-align: right;">2.14 / 69.03</td>
+<td style="text-align: right;">2.35 / 1.82</td>
+<td style="text-align: right;">89.25 / 627.00</td>
+</tr>
+</tbody>
+</table>
+<p>Unit: each cell is "LMDB SQL / SQLite p50 latency µs".</p>
+<p><strong>Table 3: Allocation and performance across several materializing operators</strong></p>
+<p>Read the same rows as Table 1, but pass the strings through three materializing operators in turn: grouping, a window function and a sort. Reproduce with the <code>multi-op</code> variant in <code>examples/alloc_trace.rs</code> [6].</p>
+<div class="codehilite"><pre><span></span><code><span class="k">select</span><span class="w"> </span><span class="n">status</span><span class="p">,</span><span class="w"> </span><span class="n">note</span><span class="p">,</span><span class="w"> </span><span class="n">peak</span><span class="p">,</span><span class="w"> </span><span class="k">max</span><span class="p">(</span><span class="n">peak</span><span class="p">)</span><span class="w"> </span><span class="n">over</span><span class="w"> </span><span class="p">(</span><span class="n">partition</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="n">status</span><span class="p">)</span>
+<span class="k">from</span><span class="w"> </span><span class="p">(</span><span class="k">select</span><span class="w"> </span><span class="n">status</span><span class="p">,</span><span class="w"> </span><span class="n">note</span><span class="p">,</span><span class="w"> </span><span class="k">max</span><span class="p">(</span><span class="n">amount</span><span class="p">)</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="n">peak</span><span class="w"> </span><span class="k">from</span><span class="w"> </span><span class="n">orders</span>
+<span class="w">      </span><span class="k">where</span><span class="w"> </span><span class="n">customer_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="err">$</span><span class="mi">1</span><span class="w"> </span><span class="k">and</span><span class="w"> </span><span class="n">status</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="err">$</span><span class="mi">2</span><span class="w"> </span><span class="k">and</span><span class="w"> </span><span class="n">amount</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="err">$</span><span class="mi">3</span>
+<span class="w">      </span><span class="k">group</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="n">status</span><span class="p">,</span><span class="w"> </span><span class="n">note</span><span class="p">)</span><span class="w"> </span><span class="n">t</span>
+<span class="k">order</span><span class="w"> </span><span class="k">by</span><span class="w"> </span><span class="n">note</span><span class="w"> </span><span class="k">desc</span><span class="p">;</span>
+</code></pre></div>
+
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">note length</th>
+<th style="text-align: right;">LMDB SQL</th>
+<th style="text-align: right;">SQLite</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">64 B</td>
+<td style="text-align: right;">7.91 / 4.2</td>
+<td style="text-align: right;">12.74 / 109</td>
+</tr>
+<tr>
+<td style="text-align: right;">4 KiB</td>
+<td style="text-align: right;">13.82 / 4.2</td>
+<td style="text-align: right;">33.19 / 757</td>
+</tr>
+<tr>
+<td style="text-align: right;">64 KiB</td>
+<td style="text-align: right;">84.74 / 4.1</td>
+<td style="text-align: right;">328.34 / 10846</td>
+</tr>
+<tr>
+<td style="text-align: right;">256 KiB</td>
+<td style="text-align: right;">320.24 / 4.0</td>
+<td style="text-align: right;">7479.64 / 32945</td>
+</tr>
+</tbody>
+</table>
+<p>Unit: each cell is "p50 latency µs / KiB allocated per execution".</p>
+<p><strong>Table 4: Parsing 100 JSON / CSV documents</strong></p>
+<p>Each execution fetches 100 documents by <code>grp</code>, keeps the results past the end of the query, then parses them into structs. On LMDB SQL the struct fields borrow the text in the transaction directly; on SQLite they follow the common pattern of one <code>String</code> per field. The CSV case uses a <code>csv_docs</code> table with the same structure, where <code>body</code> holds one CSV line. Reproduce with <code>examples/borrowed_parse.rs</code> [7].</p>
+<div class="codehilite"><pre><span></span><code><span class="k">create</span><span class="w"> </span><span class="k">table</span><span class="w"> </span><span class="n">json_docs</span><span class="w"> </span><span class="p">(</span>
+<span class="w">    </span><span class="n">id</span><span class="w">   </span><span class="nb">int</span><span class="w"> </span><span class="k">primary</span><span class="w"> </span><span class="k">key</span><span class="p">,</span>
+<span class="w">    </span><span class="n">grp</span><span class="w">  </span><span class="nb">int</span><span class="p">,</span><span class="w">      </span><span class="c1">-- 100 documents per group</span>
+<span class="w">    </span><span class="n">body</span><span class="w"> </span><span class="nb">varchar</span>
+<span class="p">);</span>
+<span class="k">create</span><span class="w"> </span><span class="k">index</span><span class="w"> </span><span class="n">json_docs_grp</span><span class="w"> </span><span class="k">on</span><span class="w"> </span><span class="n">json_docs</span><span class="w"> </span><span class="p">(</span><span class="n">grp</span><span class="p">);</span>
+
+<span class="k">select</span><span class="w"> </span><span class="n">id</span><span class="p">,</span><span class="w"> </span><span class="n">body</span><span class="w"> </span><span class="k">from</span><span class="w"> </span><span class="n">json_docs</span><span class="w"> </span><span class="k">where</span><span class="w"> </span><span class="n">grp</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="err">$</span><span class="mi">1</span><span class="p">;</span>
+</code></pre></div>
+
+<table>
+<thead>
+<tr>
+<th style="text-align: right;">Document size</th>
+<th>Case</th>
+<th style="text-align: right;">LMDB SQL</th>
+<th style="text-align: right;">SQLite</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: right;">256 B</td>
+<td>Keep raw rows only</td>
+<td style="text-align: right;">28.34 / 3.5</td>
+<td style="text-align: right;">24.64 / 28</td>
+</tr>
+<tr>
+<td style="text-align: right;">256 B</td>
+<td>Parse JSON</td>
+<td style="text-align: right;">43.27 / 12</td>
+<td style="text-align: right;">60.17 / 35</td>
+</tr>
+<tr>
+<td style="text-align: right;">2 KiB</td>
+<td>Parse JSON</td>
+<td style="text-align: right;">68.80 / 12</td>
+<td style="text-align: right;">97.20 / 214</td>
+</tr>
+<tr>
+<td style="text-align: right;">16 KiB</td>
+<td>Keep raw rows only</td>
+<td style="text-align: right;">28.60 / 3.5</td>
+<td style="text-align: right;">137.69 / 3205</td>
+</tr>
+<tr>
+<td style="text-align: right;">16 KiB</td>
+<td>Parse JSON</td>
+<td style="text-align: right;">187.33 / 12</td>
+<td style="text-align: right;">292.65 / 3212</td>
+</tr>
+<tr>
+<td style="text-align: right;">16 KiB</td>
+<td>Parse CSV</td>
+<td style="text-align: right;">35.15 / 12</td>
+<td style="text-align: right;">172.15 / 3206</td>
+</tr>
+</tbody>
+</table>
+<p>Unit: each cell is "p50 latency µs / KiB allocated per execution", with 100 rows per execution.</p>
+<h3>Analysis</h3>
+<p><strong>LMDB SQL's allocations don't depend on data size; SQLite's follow the data it returns.</strong> In Table 1, LMDB SQL always allocates 0.4 KiB. From 4 KiB on, SQLite allocates once per row, and the total roughly equals the bytes returned. SQLite shows 0 at 64 B and 1 KiB, but that doesn't mean nothing was copied: short strings are copied into a reused buffer, so no allocation is counted. Checking the returned pointers shows that every LMDB SQL pointer falls inside the mapping of the database file, and none of SQLite's do.</p>
+<p><strong>SQLite is fast on short data, but its latency grows with length; LMDB SQL's latency doesn't depend on length.</strong> At 64 B SQLite needs only 2.99 µs, faster than LMDB SQL, because copying a few dozen bytes costs next to nothing. As <code>note</code> grows, SQLite's latency and allocations grow together, reaching 66.14 µs at 256 KiB, where copying becomes the main cost. LMDB SQL stays between 2.4 and 4.4 µs throughout. It doesn't read the string content, so length doesn't affect it.</p>
+<p><strong>The gap comes from copying, not I/O.</strong> When LMDB SQL is forced to copy strings, its latency and allocations land in the same range as SQLite's (61.6 µs vs. 66.1 µs at 256 KiB).</p>
+<p><strong><code>octet_length</code> is constant time on both sides, so it is no argument for zero copy.</strong> LMDB SQL calls <code>len()</code> on the borrowed <code>&amp;str</code>. For a column used only as the argument of a length function, SQLite reads the length straight from the record header without loading the content or reading overflow pages (<code>OPFLAG_BYTELENARG</code> on <code>OP_Column</code>), so SQLite is actually faster here.</p>
+<p><strong><code>char_length</code> scans every byte on both sides, and from 64 KiB up LMDB SQL is 6 to 7 times faster.</strong> LMDB SQL counts directly on the mapped pages (<code>chars().count()</code>, about 28 GB/s at 256 KiB). SQLite first joins the overflow page content into a <code>malloc</code>ed buffer, then counts characters one by one. This is the typical "read all the content, process it lightly" case: the computation is cheap, copying dominates, and zero copy pays off the most. Recording the character count or an "ASCII only" flag at write time would make <code>char_length</code> constant time too; this is not implemented yet.</p>
+<p><strong>Every materializing operator widens the gap again.</strong> At 64 KiB and 256 KiB in Table 3, SQLite allocates 13 to 17 times the returned data, because every operator writes records in and reads them back out. LMDB SQL allocates only about 4 KiB for its hash table and sort array. LMDB SQL's latency still grows with <code>note</code>, because grouping hashes the whole <code>note</code>.</p>
+<p><strong>Parsing itself is equally fast on both sides.</strong> For 16 KiB JSON, after subtracting the fetch time, pure parsing takes about the same on both sides (159 µs vs. 155 µs). Nearly all of LMDB SQL's advantage comes from not copying during the fetch.</p>
+<h2>Conclusion</h2>
+<p>Back to the code example from the beginning. The same functionality can be written like this:</p>
+<div class="codehilite"><pre><span></span><code><span class="k">use</span><span class="w"> </span><span class="n">kite_sql</span><span class="p">::</span><span class="n">db</span><span class="p">::{</span><span class="n">Transaction</span><span class="p">,</span><span class="w"> </span><span class="n">TxnResultIter</span><span class="p">};</span>
+<span class="k">use</span><span class="w"> </span><span class="n">kite_sql</span><span class="p">::</span><span class="n">storage</span><span class="p">::</span><span class="n">lmdb</span><span class="p">::</span><span class="n">LmdbStorage</span><span class="p">;</span>
+<span class="k">use</span><span class="w"> </span><span class="n">kite_sql</span><span class="p">::</span><span class="n">Model</span><span class="p">;</span>
+<span class="k">use</span><span class="w"> </span><span class="n">serde</span><span class="p">::</span><span class="n">Serialize</span><span class="p">;</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">borrow</span><span class="p">::</span><span class="n">Cow</span><span class="p">;</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">collections</span><span class="p">::</span><span class="n">HashMap</span><span class="p">;</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">error</span><span class="p">::</span><span class="n">Error</span><span class="p">;</span>
+<span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">io</span><span class="p">::</span><span class="n">Write</span><span class="p">;</span>
+
+<span class="cp">#[derive(Default, Model, Serialize)]</span>
+<span class="cp">#[model(table = </span><span class="s">"posts"</span><span class="cp">)]</span>
+<span class="k">struct</span><span class="w"> </span><span class="nc">Post</span><span class="o">&lt;'</span><span class="na">a</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="cp">#[model(primary_key)]</span>
+<span class="w">    </span><span class="n">id</span><span class="p">:</span><span class="w"> </span><span class="kt">i32</span><span class="p">,</span>
+<span class="w">    </span><span class="n">thread_id</span><span class="p">:</span><span class="w"> </span><span class="kt">i32</span><span class="p">,</span>
+<span class="w">    </span><span class="n">parent_id</span><span class="p">:</span><span class="w"> </span><span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="c1">// 0 means a top-level comment</span>
+<span class="w">    </span><span class="n">user</span><span class="p">:</span><span class="w"> </span><span class="nc">Cow</span><span class="o">&lt;'</span><span class="na">a</span><span class="p">,</span><span class="w"> </span><span class="kt">str</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="w">    </span><span class="n">body</span><span class="p">:</span><span class="w"> </span><span class="nc">Cow</span><span class="o">&lt;'</span><span class="na">a</span><span class="p">,</span><span class="w"> </span><span class="kt">str</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="p">}</span>
+
+<span class="cp">#[derive(Serialize)]</span>
+<span class="k">struct</span><span class="w"> </span><span class="nc">Comment</span><span class="o">&lt;'</span><span class="na">a</span><span class="o">&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="cp">#[serde(flatten)]</span>
+<span class="w">    </span><span class="n">post</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="o">'</span><span class="na">a</span><span class="w"> </span><span class="nc">Post</span><span class="o">&lt;'</span><span class="na">a</span><span class="o">&gt;</span><span class="p">,</span>
+<span class="w">    </span><span class="n">replies</span><span class="p">:</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="n">Comment</span><span class="o">&lt;'</span><span class="na">a</span><span class="o">&gt;&gt;</span><span class="p">,</span>
+<span class="p">}</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">build</span><span class="o">&lt;'</span><span class="na">a</span><span class="o">&gt;</span><span class="p">(</span><span class="n">children</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="o">'</span><span class="na">a</span><span class="w"> </span><span class="nc">HashMap</span><span class="o">&lt;</span><span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="n">Post</span><span class="o">&lt;'</span><span class="na">a</span><span class="o">&gt;&gt;&gt;</span><span class="p">,</span><span class="w"> </span><span class="n">parent</span><span class="p">:</span><span class="w"> </span><span class="kt">i32</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="n">Comment</span><span class="o">&lt;'</span><span class="na">a</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="nb">Some</span><span class="p">(</span><span class="n">posts</span><span class="p">)</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">children</span><span class="p">.</span><span class="n">get</span><span class="p">(</span><span class="o">&amp;</span><span class="n">parent</span><span class="p">)</span><span class="w"> </span><span class="k">else</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="k">return</span><span class="w"> </span><span class="nb">Vec</span><span class="p">::</span><span class="n">new</span><span class="p">()</span><span class="w"> </span><span class="p">};</span>
+<span class="w">    </span><span class="n">posts</span><span class="p">.</span><span class="n">iter</span><span class="p">()</span>
+<span class="w">        </span><span class="p">.</span><span class="n">map</span><span class="p">(</span><span class="o">|</span><span class="n">post</span><span class="o">|</span><span class="w"> </span><span class="n">Comment</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">post</span><span class="p">,</span><span class="w"> </span><span class="n">replies</span><span class="p">:</span><span class="w"> </span><span class="nc">build</span><span class="p">(</span><span class="n">children</span><span class="p">,</span><span class="w"> </span><span class="n">post</span><span class="p">.</span><span class="n">id</span><span class="p">)</span><span class="w"> </span><span class="p">})</span>
+<span class="w">        </span><span class="p">.</span><span class="n">collect</span><span class="p">()</span>
+<span class="p">}</span>
+
+<span class="k">fn</span><span class="w"> </span><span class="nf">write_thread</span><span class="p">(</span><span class="n">tx</span><span class="p">:</span><span class="w"> </span><span class="kp">&amp;</span><span class="nc">mut</span><span class="w"> </span><span class="n">Transaction</span><span class="o">&lt;'</span><span class="nb">_</span><span class="p">,</span><span class="w"> </span><span class="n">LmdbStorage</span><span class="o">&gt;</span><span class="p">,</span><span class="w"> </span><span class="n">thread_id</span><span class="p">:</span><span class="w"> </span><span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="n">out</span><span class="p">:</span><span class="w"> </span><span class="nc">impl</span><span class="w"> </span><span class="n">Write</span><span class="p">)</span><span class="w"> </span><span class="p">-&gt;</span><span class="w"> </span><span class="nb">Result</span><span class="o">&lt;</span><span class="p">(),</span><span class="w"> </span><span class="nb">Box</span><span class="o">&lt;</span><span class="k">dyn</span><span class="w"> </span><span class="n">Error</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="p">{</span>
+<span class="w">    </span><span class="c1">// Post borrows LMDB pages and lives until the transaction ends, so all rows can be collected before building the tree</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="k">mut</span><span class="w"> </span><span class="n">children</span><span class="p">:</span><span class="w"> </span><span class="nc">HashMap</span><span class="o">&lt;</span><span class="kt">i32</span><span class="p">,</span><span class="w"> </span><span class="nb">Vec</span><span class="o">&lt;</span><span class="n">Post</span><span class="o">&gt;&gt;</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">HashMap</span><span class="p">::</span><span class="n">new</span><span class="p">();</span>
+<span class="w">    </span><span class="kd">let</span><span class="w"> </span><span class="n">posts</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">tx</span>
+<span class="w">        </span><span class="p">.</span><span class="n">bind</span><span class="p">(</span><span class="o">|</span><span class="n">ctx</span><span class="o">|</span><span class="w"> </span><span class="p">{</span>
+<span class="w">            </span><span class="n">ctx</span><span class="p">.</span><span class="n">from</span><span class="p">::</span><span class="o">&lt;</span><span class="n">Post</span><span class="o">&gt;</span><span class="p">()</span><span class="o">?</span>
+<span class="w">                </span><span class="p">.</span><span class="n">filter</span><span class="p">(</span><span class="o">|</span><span class="n">e</span><span class="o">|</span><span class="w"> </span><span class="n">e</span><span class="p">.</span><span class="n">column</span><span class="p">(</span><span class="n">Post</span><span class="p">::</span><span class="n">thread_id</span><span class="p">())</span><span class="o">?</span><span class="p">.</span><span class="n">eq</span><span class="p">(</span><span class="n">thread_id</span><span class="p">))</span><span class="o">?</span>
+<span class="w">                </span><span class="p">.</span><span class="n">finish</span><span class="p">()</span>
+<span class="w">        </span><span class="p">})</span><span class="o">?</span>
+<span class="w">        </span><span class="c1">// Every string field is Cow::Borrowed and points straight into an LMDB page</span>
+<span class="w">        </span><span class="p">.</span><span class="n">txn_orm</span><span class="p">::</span><span class="o">&lt;</span><span class="n">Post</span><span class="o">&gt;</span><span class="p">();</span>
+<span class="w">    </span><span class="k">for</span><span class="w"> </span><span class="n">post</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">posts</span><span class="w"> </span><span class="p">{</span>
+<span class="w">        </span><span class="kd">let</span><span class="w"> </span><span class="n">post</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">post</span><span class="o">?</span><span class="p">;</span>
+<span class="w">        </span><span class="n">children</span><span class="p">.</span><span class="n">entry</span><span class="p">(</span><span class="n">post</span><span class="p">.</span><span class="n">parent_id</span><span class="p">).</span><span class="n">or_default</span><span class="p">().</span><span class="n">push</span><span class="p">(</span><span class="n">post</span><span class="p">);</span>
+<span class="w">    </span><span class="p">}</span>
+<span class="w">    </span><span class="n">serde_json</span><span class="p">::</span><span class="n">to_writer</span><span class="p">(</span><span class="n">out</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">build</span><span class="p">(</span><span class="o">&amp;</span><span class="n">children</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">))</span><span class="o">?</span><span class="p">;</span>
+<span class="w">    </span><span class="nb">Ok</span><span class="p">(())</span>
+<span class="p">}</span>
+</code></pre></div>
+
+<p>Here the same process looks like this:</p>
+<div class="codehilite"><pre><span></span><code> Database file (LMDB mapping)
+     │
+     │  Read-only transaction: pages stay valid at the same address until it ends
+     ▼
+ B+ tree page / overflow pages (a large value is one contiguous block in the mapping)
+     │
+     │  Row decoding: read the 4-byte length, get (pointer, length)
+     ▼
+ Cow::Borrowed(&amp;str), pointing straight into the page
+     │
+     │  txn_orm: put into the fields of Post
+     ▼
+ Post { user: Cow::Borrowed, body: Cow::Borrowed, .. } (lives until the transaction ends)
+     │
+     │  Build the tree by parent_id: only pointers move
+     │  serde_json::to_writer writes the JSON
+     ▼
+ JSON
+</code></pre></div>
+
+<p>Apart from the types, the two programs are nearly identical: read <code>Post</code>s row by row, put them into a <code>HashMap</code> by <code>parent_id</code>, then build the tree recursively and serialize it. The difference is that this map holds only pointers. <code>Post</code>'s string fields are <code>Cow&lt;'_, str&gt;</code>, and in a read-only transaction they are all <code>Cow::Borrowed</code>, pointing straight into LMDB pages. Their lifetime is tied to the transaction rather than to a row, so the first row's <code>Post</code> can wait in the map alongside the last one until the tree is built and the JSON is written, and no string is copied even once. The fields are <code>Cow</code> rather than <code>&amp;str</code> because pages may change in a write transaction, in which case the fields fall back to <code>Cow::Owned</code> copies. It's not that rusqlite can't borrow: <code>row.get_ref</code> lends out a <code>&amp;str</code>, but only until the next call to <code>next</code>. Building the tree needs every row, and a <code>Post</code> borrowing from <code>row</code> can't survive the next <code>next</code>, so only copies can go into the map.</p>
+<p>This advantage has its limits. On workloads with short rows processed one at a time, the two sides are about even, with SQLite slightly faster. Strings are still copied in write transactions. Workloads like TPC-C show no change. When an aggregation operator holds borrowed rows, the pages behind them must stay in memory, but they are clean file pages that SQLite would also load into its page cache to read the same data, and the kernel can reclaim them at any time. Heap memory that can't be reclaimed is actually lower on the zero-copy side (Table 3). A read-only transaction has to stay open as long as the borrowed results live, and LMDB can't reclaim old pages while readers reference them, so holding results for a long time under heavy writes makes the database file grow.</p>
+<p>Thanks for reading. The implementation and benchmark code are in the KiteSQL repository: <a href="https://github.com/KipData/KiteSQL">https://github.com/KipData/KiteSQL</a>.</p>
+<h2>References</h2>
+<p>[1] Athinagoras Skiadopoulos, Qian Li, Peter Kraft, Kostis Kaffes, Daniel Hong, Shana Mathew, David Bestor, Michael Cafarella, Vijay Gadepally, Goetz Graefe, Jeremy Kepner, Christos Kozyrakis, Tim Kraska, Michael Stonebraker, Lalith Suresh, Matei Zaharia. <em>DBOS: A DBMS-oriented Operating System</em>. PVLDB, 15(1): 21–30, 2022. doi:<a href="https://doi.org/10.14778/3485450.3485454">10.14778/3485450.3485454</a>. PDF: <a href="https://www.vldb.org/pvldb/vol15/p21-skiadopoulos.pdf">https://www.vldb.org/pvldb/vol15/p21-skiadopoulos.pdf</a></p>
+<p>[2] GraphQL Specification, September 2025 Edition. GraphQL Foundation. <a href="https://spec.graphql.org/September2025/">https://spec.graphql.org/September2025/</a>. Project site: <a href="https://graphql.org/">https://graphql.org/</a></p>
+<p>[3] Andrew Crotty, Viktor Leis, Andrew Pavlo. <em>Are You Sure You Want to Use MMAP in Your Database Management System?</em> CIDR 2022. Project page: <a href="https://db.cs.cmu.edu/mmap-cidr2022/">https://db.cs.cmu.edu/mmap-cidr2022/</a>. PDF: <a href="https://db.cs.cmu.edu/papers/2022/cidr2022-p13-crotty.pdf">https://db.cs.cmu.edu/papers/2022/cidr2022-p13-crotty.pdf</a>. The candidate title is mentioned at 00:52 in Andy Pavlo's lecture recording: <a href="https://www.youtube.com/watch?v=1BRGU_AS25c">https://www.youtube.com/watch?v=1BRGU_AS25c</a>.</p>
+<p>[4] LMDB API documentation, Symas Corporation: <a href="http://www.lmdb.tech/doc/group__mdb.html">http://www.lmdb.tech/doc/group__mdb.html</a>. The <code>MDB_val</code> section says returned values are "valid only until a subsequent update operation, or the end of the transaction" and "commonly point into the database itself"; the <code>MDB_WRITEMAP</code> section explains that the default read-only mapping protects the database from stray pointer writes.</p>
+<p>[5] PingCAP. <em>TiDB Computing</em>, section "Mapping table data to Key-Value": <a href="https://docs.pingcap.com/tidb/stable/tidb-computing/">https://docs.pingcap.com/tidb/stable/tidb-computing/</a></p>
+<p>[6] <code>examples/alloc_trace.rs</code>: <a href="https://github.com/KipData/KiteSQL/blob/main/examples/alloc_trace.rs">https://github.com/KipData/KiteSQL/blob/main/examples/alloc_trace.rs</a>. Run: <code>cargo run --release --example alloc_trace --features lmdb,orm</code></p>
+<p>[7] <code>examples/borrowed_parse.rs</code>: <a href="https://github.com/KipData/KiteSQL/blob/main/examples/borrowed_parse.rs">https://github.com/KipData/KiteSQL/blob/main/examples/borrowed_parse.rs</a>. Run: <code>cargo run --release --example borrowed_parse --features lmdb,orm</code></p>
+  </div>
+</article>
+</main>
+<footer class="site-footer">
+  <div class="wrap">
+    <span>© 2026 KipData</span>
+    <span><a href="https://github.com/KipData/KiteSQL">KiteSQL on GitHub</a></span>
+  </div>
+</footer>
+
+</body>
+</html>
