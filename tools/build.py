@@ -40,6 +40,7 @@ ASSETS = ROOT / "assets"
 LANG_NAMES = {"en": "English", "zh-CN": "中文"}
 SITE = "KiteSQL"
 REPO = "https://github.com/KipData/KiteSQL"
+BASE_URL = "https://kitesql.kould2333.org"
 
 HEADER = """<header class="site-header">
   <div class="wrap">
@@ -70,6 +71,11 @@ PAGE = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{title}</title>
   <meta name="description" content="{description}">
+  <link rel="canonical" href="{canonical}">
+{alternates}  <meta property="og:title" content="{title}">
+  <meta property="og:description" content="{description}">
+  <meta property="og:url" content="{canonical}">
+  <meta property="og:type" content="article">
   <link rel="icon" type="image/jpeg" href="{root}favicon.jpeg">
   <link rel="stylesheet" href="{root}assets/style.css">
   <link rel="stylesheet" href="{root}assets/highlight.css">
@@ -165,10 +171,16 @@ def build() -> None:
             f'  <div class="post-body">\n{render_markdown(body)}\n  </div>\n'
             "</article>"
         )
+        alternates = "".join(
+            f'  <link rel="alternate" hreflang="{lang}" href="{BASE_URL}/blog/{slug}.html">\n'
+            for lang, slug in versions
+        ) if len(versions) > 1 else ""
         page = PAGE.format(
             lang=meta["lang"],
             title=f'{html.escape(meta["title"])} · {SITE}',
             description=html.escape(meta.get("summary", "")),
+            canonical=f"{BASE_URL}/blog/{meta['slug']}.html",
+            alternates=alternates,
             root="../",
             header=HEADER.format(root="../", repo=REPO, blogs_current=""),
             main=main,
@@ -197,12 +209,20 @@ def build() -> None:
         lang="en",
         title=f"Blogs · {SITE}",
         description="Engineering notes from the KiteSQL project.",
+        canonical=f"{BASE_URL}/",
+        alternates="",
         root="",
         header=HEADER.format(root="", repo=REPO, blogs_current=' aria-current="page"'),
         main=main,
         footer=FOOTER.format(year=year, repo=REPO),
     )
     (ROOT / "index.html").write_text(page, encoding="utf-8")
+
+    urls = [f"{BASE_URL}/"] + [f"{BASE_URL}/blog/{m['slug']}.html" for m, _ in loaded]
+    sitemap = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n'
+    sitemap += "".join(f"  <url><loc>{u}</loc></url>\n" for u in urls) + "</urlset>\n"
+    (ROOT / "sitemap.xml").write_text(sitemap, encoding="utf-8")
+    (ROOT / "robots.txt").write_text(f"User-agent: *\nAllow: /\nSitemap: {BASE_URL}/sitemap.xml\n", encoding="utf-8")
     write_highlight_css()
     print(f"built {len(loaded)} page(s), {len(primaries)} post(s)")
 

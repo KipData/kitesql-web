@@ -5,6 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>基于 LMDB 实现零拷贝的 SQL 计算 · KiteSQL</title>
   <meta name="description" content="如果存储层是 LMDB 这样基于 mmap 的 KV 引擎，SQL 引擎能不能让查询结果一路借用页，从存储到调用方一次都不拷贝？以开启 mmap 的 SQLite 为对照。">
+  <link rel="canonical" href="https://kitesql.kould2333.org/blog/zero-copy-sql-on-lmdb.zh-CN.html">
+  <link rel="alternate" hreflang="en" href="https://kitesql.kould2333.org/blog/zero-copy-sql-on-lmdb.html">
+  <link rel="alternate" hreflang="zh-CN" href="https://kitesql.kould2333.org/blog/zero-copy-sql-on-lmdb.zh-CN.html">
+  <meta property="og:title" content="基于 LMDB 实现零拷贝的 SQL 计算 · KiteSQL">
+  <meta property="og:description" content="如果存储层是 LMDB 这样基于 mmap 的 KV 引擎，SQL 引擎能不能让查询结果一路借用页，从存储到调用方一次都不拷贝？以开启 mmap 的 SQLite 为对照。">
+  <meta property="og:url" content="https://kitesql.kould2333.org/blog/zero-copy-sql-on-lmdb.zh-CN.html">
+  <meta property="og:type" content="article">
   <link rel="icon" type="image/jpeg" href="../favicon.jpeg">
   <link rel="stylesheet" href="../assets/style.css">
   <link rel="stylesheet" href="../assets/highlight.css">
